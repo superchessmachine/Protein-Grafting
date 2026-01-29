@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import argparse
+import math
+import os
+import sys
+from typing import List, Tuple, Optional
+
+from pdbfixer import PDBFixer
+from openmm.app import PDBFile, Topology
+from openmm.app.element import Element
+from openmm import unit, Vec3
+
+#example command: python stitch_4frags_overlap1.py \
+#  frag1_af_nterm.pdb frag2_exp_preloop.pdb frag3_af_loop.pdb frag4_exp_postloop.pdb \
+#  -o combined_fixed.pdb
+
+def _to_nm_value(x) -> float:
+    if hasattr(x, "value_in_unit"):
+        return float(x.value_in_unit(unit.nanometer))
+    return float(x)
+
+
+def _pos_to_vec3_nm(pos) -> Vec3:
+    if hasattr(pos, "value_in_unit"):
+        v = pos.value_in_unit(unit.nanometer)
+        return Vec3(float(v[0]), float(v[1]), float(v[2]))
+    return Vec3(_to_nm_value(pos[0]), _to_nm_value(pos[1]), _to_nm_value(pos[2]))
+
+
+def dist_nm(a, b) -> float:
+    a = _pos_to_vec3_nm(a)
+    b = _pos_to_vec3_nm(b)
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    dz = a[2] - b[2]
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+
+def load_fragment(path: str) -> Tuple[PDBFile, List]:
+    pdb = PDBFile(path)
+    residues = []
+    for chain in pdb.topology.chains():
+        for res in chain.residues():
+            residues.append(res)
+    if not residues:
+        raise RuntimeError(f"{path}: no residues found.")
+    return pdb, residues
+
+
+def residue_records(pdb: PDBFile, residues: List) -> List[Tuple[str, List[Tuple[str, Element, object]]]]:
+    atom_list = list(pdb.topology.atoms())
+    pos_list = list(pdb.positions)
+    atom_pos = {atom: pos_list[i] for i, atom in enumerate(atom_list)}
+
+    out = []
+    for res in residues:
+        atoms = []
+        for atom in res.atoms():
+            elem = atom.element if atom.element is not None else Element.getBySymbol("C")
+            atoms.append((atom.name, elem, atom_pos[atom]))
+        out.append((res.name, atoms))
+    return out
+
+
+def get_atom_pos(res_record: Tuple[str, List[Tuple[str, Element, object]]], atom_name: str) -> Optional[object]:
+    _, atoms = res_record
+    atom_name = atom_name.strip()
+    for name, _, pos in atoms:
+        if name.strip() == atom_name:
+            return pos
+    return None
+
+
+def build_combined_topology(all_res_records: List[Tuple[str, List[Tuple[str, Element, object]]]]) -> Tuple[Topology, List[Vec3]]:
+    top = Topology()
+    chain = top.addChain("A")
+    positions: List[Vec3] = []
+
+    resid = 1
+    for resname, atoms in all_res_records:
+        res = top.addResidue(resname, chain, id=str(resid))
+        resid += 1
+        for atom_name, elem, pos in atoms:
+            top.addAtom(atom_name, elem, res)
+            positions.append(_pos_to_vec3_nm(pos))
+    return top, positions
+
+
+def write_pdb(top: Topology, positions: List[Vec3], outpath: str):
+    pos_q = unit.Quantity(positions, unit.nanometer)
+    with open(outpath, "w") as f:
+        PDBFile.writeFile(top, pos_q, f, keepIds=False)
+
+
+def run_pdbfixer(in_pdb: str, out_pdb: str, add_h: bool, ph: float, keep_heterogens: bool):
+    fixer = PDBFixer(filename=in_pdb)
+
+    if not keep_heterogens:
+        fixer.removeHeterogens(keepWater=False)
+
+    # --- Critical ordering for some PDBFixer versions ---
+    fixer.findMissingResidues()
+    # We do NOT want PDBFixer to invent new residues across your stitched joins.
+    # Make it a no-op:
+    try:
+        fixer.missingResidues = {}
+    except Exception:
+        pass
+
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+
+    if add_h:
+        fixer.addMissingHydrogens(pH=ph)
+
+    with open(out_pdb, "w") as f:
+        PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Stitch PDB fragments with 1-residue overlaps and run PDBFixer.")
+    ap.add_argument("fragments", nargs="+", help="Fragment PDBs in N->C order.")
+    ap.add_argument("-o", "--output", required=True, help="Output stitched + fixed PDB.")
+    ap.add_argument("--add-hydrogens", action="store_true", help="Add hydrogens (PDBFixer).")
+    ap.add_argument("--ph", type=float, default=7.0, help="pH for hydrogens (default 7.0).")
+    ap.add_argument("--keep-heterogens", action="store_true", help="Keep heterogens (default removes).")
+    ap.add_argument("--tmp", default="__stitched_raw.pdb", help="Temporary raw stitched PDB.")
+    ap.add_argument("--overlap-ca-threshold-a", type=float, default=2.0,
+                    help="Warn if overlap CA-CA distance > this (Angstrom). Default 2.0 Å.")
+    args = ap.parse_args()
+
+    if len(args.fragments) < 2:
+        print("Need at least 2 fragments.", file=sys.stderr)
+        sys.exit(2)
+
+    overlap_thresh_nm = args.overlap_ca_threshold_a / 10.0  # Å -> nm
+
+    all_res = []
+    prev_last = None
+
+    for i, frag_path in enumerate(args.fragments):
+        pdb, residues = load_fragment(frag_path)
+        recs = residue_records(pdb, residues)
+
+        if i > 0 and prev_last is not None:
+            curr_first = recs[0]
+
+            prev_ca = get_atom_pos(prev_last, "CA")
+            curr_ca = get_atom_pos(curr_first, "CA")
+            if prev_ca is not None and curr_ca is not None:
+                d = dist_nm(prev_ca, curr_ca)
+                if d > overlap_thresh_nm:
+                    print(f"[WARN] Overlap CA-CA distance = {d*10.0:.2f} Å (> {args.overlap_ca_threshold_a:.2f} Å) "
+                          f"at junction {i} ({args.fragments[i-1]} -> {frag_path}).",
+                          file=sys.stderr)
+
+            if len(recs) < 2:
+                raise RuntimeError(f"{frag_path}: too short to drop overlap residue (has <2 residues).")
+            recs = recs[1:]  # drop 1-res overlap
+
+        all_res.extend(recs)
+        prev_last = recs[-1]
+
+    top, positions = build_combined_topology(all_res)
+    write_pdb(top, positions, args.tmp)
+
+    run_pdbfixer(
+        in_pdb=args.tmp,
+        out_pdb=args.output,
+        add_h=args.add_hydrogens,
+        ph=args.ph,
+        keep_heterogens=args.keep_heterogens,
+    )
+
+    try:
+        os.remove(args.tmp)
+    except OSError:
+        pass
+
+    print(f"Wrote: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
