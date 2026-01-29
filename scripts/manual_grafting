@@ -10,6 +10,7 @@ from openmm.app import PDBFile, Topology
 from openmm.app.element import Element
 from openmm import unit, Vec3
 
+#To start you want to open the two proteins in pymol and align them, export the proteins, then reload them and keep 1 residue overhangs for the regions you want to stitch together
 #example command: python stitch_4frags_overlap1.py \
 #  frag1_af_nterm.pdb frag2_exp_preloop.pdb frag3_af_loop.pdb frag4_exp_postloop.pdb \
 #  -o combined_fixed.pdb
