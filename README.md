@@ -24,7 +24,9 @@ The logical order below mirrors the original "step1/step2/step3" folders while r
    - Trim/align so that the experimental construct exactly matches the region that should replace the AF3 coordinates. Save the aligned experimental subset as `experimental_aligned_subset.pdb` and the aligned AF3 model as `full_length_af3_model.pdb` (names can be anything; they just need to match the CLI arguments).
 4. **Graft experimental coordinates onto the AF3 model**
    - Run `scripts/graft_aligned_structures.py` with the aligned PDBs plus the FASTA files you generated above. This script inserts any extra N-terminal residues from the experimental construct and overwrites the AF3 coordinates for the overlapping region using the experimental atoms. All residues are renumbered sequentially for a tidy output.
-5. **Rebuild unresolved loops (optional)**
+5. **Fill unresolved residues from a complete model (optional)**
+   - If the experimental structure and complete model share the same sequence register, use `scripts/graft_missing_residues.py` to retain experimental coordinates wherever present and copy only unresolved residue positions from the complete model. This path can also drop an N-terminal construct prefix and retain selected experimental heterogens such as metal ions.
+6. **Rebuild unresolved loops (optional)**
    - If the grafted model is missing internal loops, run `scripts/rebuild_loops_with_glycine.py` to detect gaps by sequence numbering and Cα spacing. Use `--gap-report loops.json --detect-only` to review the proposed insertions, edit the JSON to the residue identities you want, then call `scripts/rebuild_loops_from_config.py` to rebuild the loops (and optionally add hydrogens) with your edited sequence.
 
 ## Script Reference
@@ -52,7 +54,16 @@ python scripts/graft_aligned_structures.py \
   --out grafted_model.pdb \
   --extra-prefix-length 1
 
-# 5) Detect/rebuild missing loops with glycine and emit an editable config
+# 5) Fill unresolved residue positions from a complete same-register model
+python scripts/graft_missing_residues.py \
+  --experimental experimental_structure.cif \
+  --model complete_model.cif \
+  --out hybrid_model.pdb \
+  --report hybrid_model_report.json \
+  --drop-prefix 0 \
+  --keep-heterogen ZN
+
+# 6) Detect/rebuild missing loops with glycine and emit an editable config
 python scripts/rebuild_loops_with_glycine.py \
   --in grafted_model.pdb \
   --out grafted_model_glycine_loops.pdb \
@@ -60,7 +71,7 @@ python scripts/rebuild_loops_with_glycine.py \
   --residue-name GLY \
   --detect-only
 
-# 6) Rebuild loops from the edited config with custom sequences
+# 7) Rebuild loops from the edited config with custom sequences
 python scripts/rebuild_loops_from_config.py \
   --in grafted_model_glycine_loops.pdb \
   --config loops_config.json \
@@ -70,6 +81,8 @@ python scripts/rebuild_loops_from_config.py \
 ```
 
 `--extra-prefix-length` reflects how many residues exist at the N-terminus of the experimental construct but not in the AF3 model (set it to 0 if there is no insertion). The script assumes that once those residues are removed, `fasta1` is a prefix of `fasta2` and that both PDBs are already in the same coordinate frame.
+
+`graft_missing_residues.py` is useful when you want the experimental structure to remain the source of truth. It matches by polymer sequence position, optionally superposes the complete model onto the resolved experimental residues, drops any sequence prefix you specify, retains experimental coordinates wherever they exist, and fills only absent polymer residues from the model. For difficult insertions, repeat `--model-range START-END` and set `--local-align-flank N` to use model coordinates for a bounded segment aligned to nearby experimental anchors. The JSON report lists filled ranges, overwritten experimental ranges, retained heterogens, alignment RMSD, local range fits, and peptide-bond junction warnings so you can inspect any geometrically difficult insertions before using the hybrid model downstream.
 
 ## Loop Rebuilding Utilities
 - `scripts/rebuild_loops_with_glycine.py` drives the automatic detection step. PDBFixer-supplied metadata is combined with residue numbering gaps and Cα–Cα distances to estimate how many residues should sit between two coordinates. Everything is filled with the residue you pass via `--residue-name` (GLY by default), and heterogens are removed unless `--keep-heterogens` is set. Add `--include-termini` to patch missing residues at the start or end of a chain. When you supply `--gap-report`, the script stores every detected gap (with the surrounding residues, chain index, insert position, and notes explaining which heuristic flagged it). Passing `--detect-only` stops after writing the JSON so you can review it before touching coordinates.
