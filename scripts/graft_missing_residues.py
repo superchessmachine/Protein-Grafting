@@ -434,10 +434,11 @@ def build_hybrid(args: argparse.Namespace) -> Dict:
     model = load_structure(args.model, args.model_chain, [])
     model_ranges = _parse_ranges(args.model_range)
 
+    sequence_source = model.sequence if args.use_model_sequence else experimental.sequence
     seq_ids = [
         seq_id
-        for seq_id in sorted(experimental.sequence)
-        if seq_id > args.drop_prefix and experimental.sequence[seq_id] in STANDARD_AA
+        for seq_id in sorted(sequence_source)
+        if seq_id > args.drop_prefix and sequence_source[seq_id] in STANDARD_AA
     ]
     if not seq_ids:
         raise SystemExit("No output residues remain after applying --drop-prefix.")
@@ -614,6 +615,7 @@ def build_hybrid(args: argparse.Namespace) -> Dict:
                 [seq_id for seq_id in seq_ids if seq_id in experimental.atoms_by_seq and _seq_in_ranges(seq_id, model_ranges)]
             ),
             "unfilled_ranges": _collapse_ranges(unfilled_seq_ids),
+            "sequence_source": "model" if args.use_model_sequence else "experimental",
             "model_ranges": [
                 {"start": start, "end": end, "count": end - start + 1}
                 for start, end in model_ranges
@@ -656,6 +658,15 @@ def main():
         choices=["scheme", "label", "compact"],
         default="scheme",
         help="Output residue numbering: experimental scheme, sequence labels, or compact 1..N.",
+    )
+    parser.add_argument(
+        "--use-model-sequence",
+        action="store_true",
+        help=(
+            "Use the model residue list as the output sequence. This is useful for "
+            "numbered PDB inputs where unresolved experimental residues are absent "
+            "from ATOM records but present in a same-register complete model."
+        ),
     )
     parser.add_argument(
         "--keep-heterogen",
